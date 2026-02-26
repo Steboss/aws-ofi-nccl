@@ -434,6 +434,79 @@ static int get_info_for_node(hwloc_obj_t node, struct fi_info *info_list, struct
 	return 0;
 }
 
+static void dump_fi_info_bdfs(struct fi_info *info_list, int *num_infos, int *num_with_pci)
+{
+	if (num_infos) *num_infos = 0;
+	if (num_with_pci) *num_with_pci = 0;
+
+	if (!info_list) {
+		NCCL_OFI_INFO(NCCL_INIT, "TOPO_DEBUG FI list is empty");
+		return;
+	}
+
+	struct fi_info *next = info_list;
+	int idx = 0;
+	do {
+		struct fi_info *info = next;
+		next = info ? info->next : NULL;
+		if (num_infos) ++(*num_infos);
+
+		const char *provider = (info && info->fabric_attr && info->fabric_attr->prov_name) ?
+			info->fabric_attr->prov_name : "<unknown>";
+		const char *domain = (info && info->domain_attr && info->domain_attr->name) ?
+			info->domain_attr->name : "<unknown>";
+
+		struct fi_pci_attr *attr = info ? ofi_info_get_pci_attr(info) : NULL;
+		if (!attr) {
+			NCCL_OFI_INFO(NCCL_INIT,
+				      "TOPO_DEBUG FI[%d] provider=%s domain=%s has no PCI attributes",
+				      idx, provider, domain);
+		} else {
+			if (num_with_pci) ++(*num_with_pci);
+			NCCL_OFI_INFO(NCCL_INIT,
+				      "TOPO_DEBUG FI[%d] provider=%s domain=%s bdf=%04x:%02x:%02x.%01x",
+				      idx, provider, domain,
+				      attr->domain_id, attr->bus_id, attr->device_id, attr->function_id);
+		}
+
+		++idx;
+	} while (next && next != info_list);
+}
+
+static void dump_hwloc_pci_bdfs(hwloc_topology_t topo)
+{
+	hwloc_obj_t obj = NULL;
+	int idx = 0;
+
+	while ((obj = hwloc_get_next_pcidev(topo, obj))) {
+		bool is_accel = false;
+		int ret = is_accelerator_dev(obj, &is_accel);
+		if (ret != 0) {
+			NCCL_OFI_INFO(NCCL_INIT,
+				      "TOPO_DEBUG HWLOC_PCI[%d] accelerator check failed: %d",
+				      idx, ret);
+			is_accel = false;
+		}
+
+		if (!obj->attr) {
+			NCCL_OFI_INFO(NCCL_INIT,
+				      "TOPO_DEBUG HWLOC_PCI[%d] has NULL attributes",
+				      idx);
+			++idx;
+			continue;
+		}
+
+		NCCL_OFI_INFO(NCCL_INIT,
+			      "TOPO_DEBUG HWLOC_PCI[%d] bdf=%04x:%02x:%02x.%01x class=%04x vendor=%04x device=%04x accel=%d",
+			      idx,
+			      obj->attr->pcidev.domain, obj->attr->pcidev.bus,
+			      obj->attr->pcidev.dev, obj->attr->pcidev.func,
+			      obj->attr->pcidev.class_id, obj->attr->pcidev.vendor_id,
+			      obj->attr->pcidev.device_id, is_accel ? 1 : 0);
+		++idx;
+	}
+}
+
 /*
  * @brief	Count number of topology nodes that have a NIC or Nvidia GPU in its subtree
  *
@@ -640,11 +713,14 @@ static hwloc_obj_t mark_nccl_cpuid(hwloc_topology_t topo,
  * @return
  */
 static int set_user_data(nccl_ofi_topo_t *ofi_topo,
-				  struct fi_info *info_list)
+					 struct fi_info *info_list)
 {
 	int ret = 0;
 	hwloc_obj_t obj = NULL;
 	nccl_ofi_topo_data_iterator_t data_iter;
+	int num_hwloc_pci = 0;
+	int num_hwloc_accels = 0;
+	int num_mapped_fi = 0;
 
 	/* Retrieve number of topology nodes that have a Nvidia GPU or a NIC in their subtree */
 	int num_nodes = 0;
@@ -669,11 +745,15 @@ static int set_user_data(nccl_ofi_topo_t *ofi_topo,
 	while ((obj = hwloc_get_next_pcidev(ofi_topo->topo, obj))) {
 		bool is_accel = false;
 		struct fi_info *info;
+		++num_hwloc_pci;
 
 		ret = is_accelerator_dev(obj, &is_accel);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Error while checking whether hwloc topology node is nvidia GPU");
 			return ret;
+		}
+		if (is_accel) {
+			++num_hwloc_accels;
 		}
 
 		ret = get_info_for_node(obj, info_list, &info);
@@ -691,6 +771,7 @@ static int set_user_data(nccl_ofi_topo_t *ofi_topo,
 		}
 
 		if (info) {
+			++num_mapped_fi;
 			/* Copy libfabric NIC info struct and store info struct in
 			 * user data of topology node */
 			nccl_ofi_topo_data_t *user_data = (nccl_ofi_topo_data_t *)obj->userdata;
@@ -705,6 +786,25 @@ static int set_user_data(nccl_ofi_topo_t *ofi_topo,
 			ofi_topo->max_group_size = 1;
 		}
 
+	}
+
+	if (ofi_topo->max_group_size < 1) {
+		int num_fi_infos = 0;
+		int num_fi_with_pci = 0;
+		const char *hwloc_xmlfile = getenv("HWLOC_XMLFILE");
+		const char *nccl_topo_file = getenv("NCCL_TOPO_FILE");
+
+		dump_fi_info_bdfs(info_list, &num_fi_infos, &num_fi_with_pci);
+		NCCL_OFI_WARN("TOPO_DEBUG FI<->HWLOC mapping failure: mapped_fi=%d hwloc_pci=%d hwloc_accel=%d fi_infos=%d fi_infos_with_pci=%d skip_nics_without_accel=%d HWLOC_XMLFILE=%s NCCL_TOPO_FILE=%s",
+			      num_mapped_fi,
+			      num_hwloc_pci,
+			      num_hwloc_accels,
+			      num_fi_infos,
+			      num_fi_with_pci,
+			      ofi_nccl_skip_nics_without_accel.get() ? 1 : 0,
+			      hwloc_xmlfile ? hwloc_xmlfile : "<unset>",
+			      nccl_topo_file ? nccl_topo_file : "<unset>");
+		dump_hwloc_pci_bdfs(ofi_topo->topo);
 	}
 
 	/* Set closest_numa_node for the upcoming cpu xml tagging. */
